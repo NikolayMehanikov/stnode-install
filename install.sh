@@ -148,7 +148,7 @@ prompt_node_config() {
 	PUBLIC_URL="https://${PUBLIC_DOMAIN}"
 
 	local parser_raw
-	parser_raw=$(prompt_value "Parser API URL" "https://parser.nfgate.net")
+	parser_raw=$(prompt_value "Parser API URL" "https://parser.example.com")
 	parser_raw=$(normalize_domain "$parser_raw")
 	PARSER_BASE_URL="https://${parser_raw}"
 
