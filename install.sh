@@ -139,6 +139,16 @@ partition_for_disk() {
 
 setup_storage() {
 	step "Detecting storage disk"
+
+	if mountpoint -q /mnt/storage 2>/dev/null; then
+		STORAGE_HOST_PATH="/mnt/storage"
+		chmod 755 "$STORAGE_HOST_PATH"
+		local free_h
+		free_h=$(df -B1 --output=avail "$STORAGE_HOST_PATH" | tail -n 1 | xargs numfmt --to=iec --suffix=B 2>/dev/null || echo "?")
+		ok "using existing mount $STORAGE_HOST_PATH ($free_h free)"
+		return
+	fi
+
 	local candidates_file
 	candidates_file=$(mktemp)
 	local biggest_device=""
@@ -211,7 +221,7 @@ setup_storage() {
 		if [[ -z "$target_partition" ]]; then
 			die "partition not found after parted on $biggest_device"
 		fi
-		mkfs.ext4 -L noctafilm-storage -F "$target_partition" >/dev/null
+		mkfs.ext4 -L nocta-storage -F "$target_partition" >/dev/null
 		target_fs="ext4"
 	fi
 
