@@ -66,8 +66,8 @@ ensure_packages() {
 	step "Checking system packages"
 	apt-get update -qq
 	local need_install=()
-	for package in curl ca-certificates git rsync openssl jq; do
-		if ! command -v "$package" >/dev/null 2>&1; then
+	for package in curl ca-certificates git rsync openssl jq parted e2fsprogs util-linux; do
+		if ! dpkg -s "$package" >/dev/null 2>&1; then
 			need_install+=("$package")
 		fi
 	done
@@ -90,53 +90,148 @@ ensure_docker() {
 	ok "docker installed"
 }
 
-list_storage_candidates() {
-	step "Available storage locations"
-	local lines=()
-	while IFS= read -r line; do
-		lines+=("$line")
-	done < <(df -B1 --output=target,size,avail,fstype -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | tail -n +2 | sort -u)
-	if [[ ${#lines[@]} -eq 0 ]]; then
-		die "no usable mount points found via df"
-	fi
-	local index=1
-	declare -ga STORAGE_OPTIONS=()
-	echo "  #   Mount                  Total       Free        FS"
-	echo "  --- ---------------------- ----------- ----------- ----"
-	for line in "${lines[@]}"; do
-		local mount size avail fs
-		mount=$(awk '{print $1}' <<<"$line")
-		size=$(awk '{print $2}' <<<"$line")
-		avail=$(awk '{print $3}' <<<"$line")
-		fs=$(awk '{print $4}' <<<"$line")
-		local size_h avail_h
-		size_h=$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "$size")
-		avail_h=$(numfmt --to=iec --suffix=B "$avail" 2>/dev/null || echo "$avail")
-		printf "  %-3s %-22s %-11s %-11s %s\n" "$index)" "$mount" "$size_h" "$avail_h" "$fs"
-		STORAGE_OPTIONS+=("$mount")
-		((index++))
-	done
+disk_has_mounted_partition() {
+	local device="$1"
+	local mountpoint
+	while read -r mountpoint; do
+		[[ -n "$mountpoint" ]] && return 0
+	done < <(lsblk -nl -o MOUNTPOINTS "$device" 2>/dev/null | tail -n +2)
+	return 1
 }
 
-choose_storage_location() {
-	list_storage_candidates
-	local choice=""
-	while true; do
-		choice=$(prompt_value "Select storage location" "1")
-		if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#STORAGE_OPTIONS[@]} )); then
-			STORAGE_BASE="${STORAGE_OPTIONS[$((choice - 1))]}"
-			break
-		fi
-		warn "invalid selection, enter a number from 1 to ${#STORAGE_OPTIONS[@]}"
-	done
-	if [[ "$STORAGE_BASE" == "/" ]]; then
-		STORAGE_HOST_PATH="/storage"
-	else
-		STORAGE_HOST_PATH="${STORAGE_BASE%/}/storage"
+disk_filesystem_type() {
+	local device="$1"
+	local fstype
+	fstype=$(blkid -s TYPE -o value "$device" 2>/dev/null || true)
+	if [[ -n "$fstype" ]]; then
+		printf '%s' "$fstype"
+		return
 	fi
+	while read -r child_fs; do
+		if [[ -n "$child_fs" ]]; then
+			printf '%s' "$child_fs"
+			return
+		fi
+	done < <(lsblk -nl -o FSTYPE "$device" 2>/dev/null | tail -n +2)
+}
+
+disk_first_partition_with_fs() {
+	local device="$1"
+	while IFS= read -r line; do
+		local part_name part_fs
+		part_name=$(awk '{print $1}' <<<"$line")
+		part_fs=$(awk '{print $2}' <<<"$line")
+		if [[ -n "$part_fs" && "$part_name" != "$device" ]]; then
+			printf '%s' "$part_name"
+			return
+		fi
+	done < <(lsblk -nlp -o NAME,FSTYPE "$device" 2>/dev/null)
+}
+
+partition_for_disk() {
+	local device="$1"
+	if [[ -e "${device}1" ]]; then
+		printf '%s' "${device}1"
+	elif [[ -e "${device}p1" ]]; then
+		printf '%s' "${device}p1"
+	fi
+}
+
+setup_storage() {
+	step "Detecting storage disk"
+	local candidates_file
+	candidates_file=$(mktemp)
+	local biggest_device=""
+	local biggest_size=0
+	local biggest_fs=""
+
+	while IFS= read -r line; do
+		local name size type
+		name=$(awk '{print $1}' <<<"$line")
+		size=$(awk '{print $2}' <<<"$line")
+		type=$(awk '{print $3}' <<<"$line")
+		[[ "$type" != "disk" ]] && continue
+		[[ "$name" == /dev/sr* ]] && continue
+		[[ "$size" -lt 50000000000 ]] && continue
+		if disk_has_mounted_partition "$name"; then
+			continue
+		fi
+		local fstype
+		fstype=$(disk_filesystem_type "$name")
+		echo "$name|$size|$fstype" >> "$candidates_file"
+	done < <(lsblk -bnlp -o NAME,SIZE,TYPE 2>/dev/null)
+
+	if [[ ! -s "$candidates_file" ]]; then
+		rm -f "$candidates_file"
+		die "no unmounted disk found (need a separate data disk attached to this VPS)"
+	fi
+
+	while IFS='|' read -r device size fstype; do
+		if (( size > biggest_size )); then
+			biggest_device="$device"
+			biggest_size="$size"
+			biggest_fs="$fstype"
+		fi
+	done < "$candidates_file"
+	rm -f "$candidates_file"
+
+	local size_h
+	size_h=$(numfmt --to=iec --suffix=B "$biggest_size" 2>/dev/null || echo "$biggest_size")
+	echo "  Selected disk: $biggest_device ($size_h)"
+
+	STORAGE_HOST_PATH="/mnt/storage"
 	mkdir -p "$STORAGE_HOST_PATH"
+
+	local target_partition=""
+	local target_fs=""
+
+	if [[ -n "$biggest_fs" ]]; then
+		case "$biggest_fs" in
+			ext4|ext3|xfs|btrfs)
+				target_partition=$(disk_first_partition_with_fs "$biggest_device")
+				if [[ -z "$target_partition" ]]; then
+					target_partition="$biggest_device"
+				fi
+				target_fs=$(blkid -s TYPE -o value "$target_partition" 2>/dev/null)
+				echo "  Disk has existing $target_fs filesystem on $target_partition — mounting as-is"
+				;;
+			*)
+				die "disk $biggest_device has unsupported filesystem '$biggest_fs' — please wipe it manually first or use a clean disk"
+				;;
+		esac
+	else
+		echo "  Disk is empty — creating GPT partition + ext4"
+		parted -s "$biggest_device" mklabel gpt
+		parted -s "$biggest_device" mkpart primary ext4 0% 100%
+		sleep 2
+		partprobe "$biggest_device" 2>/dev/null || true
+		udevadm settle 2>/dev/null || true
+		sleep 1
+		target_partition=$(partition_for_disk "$biggest_device")
+		if [[ -z "$target_partition" ]]; then
+			die "partition not found after parted on $biggest_device"
+		fi
+		mkfs.ext4 -L noctafilm-storage -F "$target_partition" >/dev/null
+		target_fs="ext4"
+	fi
+
+	if ! mountpoint -q "$STORAGE_HOST_PATH"; then
+		mount "$target_partition" "$STORAGE_HOST_PATH"
+	fi
 	chmod 755 "$STORAGE_HOST_PATH"
-	ok "storage path: $STORAGE_HOST_PATH"
+
+	local uuid
+	uuid=$(blkid -s UUID -o value "$target_partition" 2>/dev/null)
+	if [[ -z "$uuid" ]]; then
+		die "could not read UUID for $target_partition"
+	fi
+	if ! grep -q "$uuid" /etc/fstab; then
+		echo "UUID=$uuid  $STORAGE_HOST_PATH  $target_fs  defaults,noatime  0 2" >> /etc/fstab
+	fi
+
+	local free_h
+	free_h=$(df -B1 --output=avail "$STORAGE_HOST_PATH" | tail -n 1 | xargs numfmt --to=iec --suffix=B 2>/dev/null || echo "?")
+	ok "mounted $target_partition at $STORAGE_HOST_PATH ($target_fs, $free_h free)"
 }
 
 prompt_node_config() {
@@ -294,7 +389,7 @@ main() {
 
 	ensure_packages
 	ensure_docker
-	choose_storage_location
+	setup_storage
 	prompt_node_config
 	prompt_git_credentials
 	clone_source
