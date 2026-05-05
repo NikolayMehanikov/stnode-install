@@ -21,24 +21,34 @@ require_root() {
 	fi
 }
 
+sanitize_input() {
+	local raw="$1"
+	raw="${raw//$'\r'/}"
+	raw="${raw#"${raw%%[![:space:]]*}"}"
+	raw="${raw%"${raw##*[![:space:]]}"}"
+	printf '%s' "$raw"
+}
+
 prompt_value() {
 	local label="$1"
 	local default_value="${2:-}"
 	local result
 	if [[ -n "$default_value" ]]; then
 		read -r -p "  $label [$default_value]: " result
+		result=$(sanitize_input "$result")
 		printf '%s' "${result:-$default_value}"
 	else
 		read -r -p "  $label: " result
-		printf '%s' "$result"
+		printf '%s' "$(sanitize_input "$result")"
 	fi
 }
 
 prompt_secret() {
 	local label="$1"
 	local result
-	read -r -s -p "  $label: " result
-	echo
+	read -r -s -p "  $label: " result </dev/tty
+	echo >/dev/tty
+	result=$(printf '%s' "$result" | tr -d '[:space:]')
 	printf '%s' "$result"
 }
 
@@ -310,9 +320,15 @@ clone_source() {
 		)
 	else
 		mkdir -p "$INSTALL_ROOT"
-		if ! git clone --quiet --depth 1 -b "$BRANCH_NAME" "$credential_url" "$INSTALL_ROOT" 2>/dev/null; then
-			die "git clone failed (check credentials, repo URL, branch name)"
+		local clone_error_log
+		clone_error_log=$(mktemp)
+		if ! git clone --quiet --depth 1 -b "$BRANCH_NAME" "$credential_url" "$INSTALL_ROOT" 2>"$clone_error_log"; then
+			local clone_error
+			clone_error=$(cat "$clone_error_log")
+			rm -f "$clone_error_log"
+			die "git clone failed: $clone_error"
 		fi
+		rm -f "$clone_error_log"
 		(cd "$INSTALL_ROOT" && git remote set-url origin "$GIT_REPO_URL")
 	fi
 	chmod 700 "$INSTALL_ROOT"
